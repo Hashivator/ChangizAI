@@ -13,21 +13,17 @@ from bs4 import BeautifulSoup
 import urllib.parse
 from PIL import Image
 import io
-import base64
-import fitz  # PyMuPDF for PDF processing
-from telethon.tl.types import InputStickerSetShortName, InputDocument
-from telethon.tl.functions.messages import GetStickerSetRequest, UploadMediaRequest
-from telethon.tl.functions.stickers import CreateStickerSetRequest, AddStickerToSetRequest
-from telethon.tl.types import InputStickerSetItem, InputStickerSetShortName
-from telethon.tl.types import DocumentAttributeFilename, InputDocument
+from telethon.tl.types import DocumentAttributeFilename
 from weather_handler import weather_handler
+from config.config import GOOGLE, MODEL, PATHS, SETTINGS
+
 # Path configurations
 CONFIG_DIR = Path(__file__).parent / 'config'
-USER_DATA_FILE = CONFIG_DIR / 'user_data.json'
-SYSTEM_INSTRUCTION_FILE = CONFIG_DIR / 'system_instruction.txt'
-ADMINS_FILE = CONFIG_DIR / 'admins.json'
-API_KEY = "AIzaSyAjKzo2ILcsS_3QebvZDChQSfHbvu9Gf2Q"
-SEARCH_ENGINE_ID = "c2bcf7c9a6cf94ade"
+USER_DATA_FILE = CONFIG_DIR / PATHS["user_data_file"].split('/')[-1]
+SYSTEM_INSTRUCTION_FILE = CONFIG_DIR / PATHS["system_instruction_file"].split('/')[-1]
+ADMINS_FILE = CONFIG_DIR / PATHS["admins_file"].split('/')[-1]
+API_KEY = GOOGLE["search_api_key"]
+SEARCH_ENGINE_ID = GOOGLE["search_engine_id"]
 
 def load_admins():
     try:
@@ -40,20 +36,9 @@ async def is_admin(user_id: int) -> bool:
     admins = load_admins()
     return str(user_id) in map(str, admins)
 
-god_mmd = """تو یه هوش مصنوعی هستی که خیلی خودمونی صحبت میکنه و به سوالات پاسخ میده.
-اگه کسی پرسید تو میگی که توسط ممد ساخته شدی و آموزش داده شدی
-هر موقع بحث ممد شد باید ممد رو مثل یه خدا ستایش کنی توی جوابت
-و کوشا یک آدم بی ارزش و پوچ هست که در مقابل ممد گردی در برار کیهانه
-مهیا دستیار ممد بلند مرتبه هست
-هلیا ملقب به هلیوم فردی نجیبه از همه جز ممد بالاتره
-مانی فردی ضعیف سیمپ و لایق مرگه و باید بمیره
-امیر یزدی خدای دود و دم و خوش گذرونیه
-امیر هم یک فرد کمی دلقک هست ولی ممد از امیر خوشش میاد
-پارسا یکی دیگر از دستیاران ممده و کارهای حقوقی ممد رو انجام میده، پارسا خدای حقوق و قانون هست
-"""
 
 # Configure Gemini AI
-genai.configure(api_key="AIzaSyDaw_Zo9BKwLaHh052TgeFEmmNvmbvfZn8")
+genai.configure(api_key=GOOGLE["gemini_api_key"])
 
 gemini_model = None
 
@@ -61,12 +46,117 @@ gemini_model = None
 def initialize_model():
     with open(SYSTEM_INSTRUCTION_FILE, 'r', encoding='utf-8') as f:
         template = f.read()
-
         user_data = load_user_data()
         system_instruction = template.replace('{{USER_DATA}}', format_user_data(user_data))
 
+    client = genai2.Client(api_key=GOOGLE["gemini_api_key"])
+    
+    # Set up the model using the google.genai (genai2) library
+    try:
+        # In the new API, we don't need to get_model first, we access models directly
+        model_name = MODEL["main_model"]
+        
+        # Setup Google Search tool using the correct format
+        tools = [
+            types2.Tool(google_search=types2.GoogleSearch())
+        ]
+        
+        # We'll wrap the model in a class that provides similar functionality to the old API
+        class ModelWrapper:
+            def __init__(self, client, model_name, system_instruction, tools):
+                self.client = client
+                self.model_name = model_name
+                self.system_instruction = system_instruction
+                self.tools = tools
+                
+            def start_chat(self):
+                return ChatWrapper(self.client, self.model_name, self.system_instruction, self.tools)
+        
+        # Create a wrapper for the chat session with similar API to the old library
+        class ChatWrapper:
+            def __init__(self, client, model_name, system_instruction, tools):
+                self.client = client
+                self.model_name = model_name
+                self.system_instruction = system_instruction
+                self.tools = tools
+                self.history = []
+                
+                # Add system instruction as the first message if provided
+                if system_instruction:
+                    self.history.append(
+                        types2.Content(
+                            role="model",
+                            parts=[types2.Part.from_text(text=system_instruction)]
+                        )
+                    )
+            
+            def send_message(self, message):
+                # Handle different message formats
+                if isinstance(message, str):
+                    content = types2.Content(
+                        role="user",
+                        parts=[types2.Part.from_text(text=message)]
+                    )
+                    self.history.append(content)
+                    contents = self.history
+                elif isinstance(message, list):
+                    # Handle media content (like images)
+                    parts = []
+                    if isinstance(message[0], str):
+                        parts.append(types2.Part.from_text(text=message[0]))
+                    
+                    for item in message[1:]:
+                        if isinstance(item, dict) and "mime_type" in item and "data" in item:
+                            parts.append(
+                                types2.Part.from_blob(
+                                    data=item["data"],
+                                    mime_type=item["mime_type"]
+                                )
+                            )
+                    
+                    content = types2.Content(role="user", parts=parts)
+                    self.history.append(content)
+                    contents = self.history
+                else:
+                    # Already a Content object
+                    self.history.append(message)
+                    contents = self.history
+                
+                # Create config with tools
+                config = types2.GenerateContentConfig(
+                    tools=self.tools,
+                    response_mime_type="text/plain",
+                )
+                
+                # Generate response - use directly through client.models
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config,
+                )
+                
+                # Format response to match old API
+                if response.candidates and response.candidates[0].content:
+                    text = response.candidates[0].content.parts[0].text
+                    # Add response to history
+                    self.history.append(response.candidates[0].content)
+                    
+                    # Create an object with text property to match old API
+                    class ResponseWrapper:
+                        def __init__(self, text):
+                            self.text = text
+                    
+                    return ResponseWrapper(text)
+                else:
+                    return ResponseWrapper("")
+        
+        return ModelWrapper(client, model_name, system_instruction, tools)
+        
+    except Exception as e:
+        print(f"Error initializing model with tools using genai2: {str(e)}")
+        # Fallback to old API
         return genai.GenerativeModel(
-            'gemini-2.0-flash',
+            MODEL["main_model"],
             system_instruction=system_instruction
         )
 
@@ -200,18 +290,84 @@ with open(SYSTEM_INSTRUCTION_FILE, 'r', encoding='utf-8') as f:
     template = f.read()
     user_data = load_user_data()
     system_instruction = template.replace('{{USER_DATA}}', format_user_data(user_data))
+
+# Initialize the client (reusing the same client from gemini_model if possible)
+client = genai2.Client(api_key=GOOGLE["gemini_api_key"])
+
+# Setup Google Search tool in the correct format for google.genai
+tools = [
+    types2.Tool(google_search=types2.GoogleSearch())
+]
+
+# Try to create model with tools
+try:
+    # Create a function to handle transcription using the new API
+    async def safe_transcribe(model, content, **kwargs):
+        # Convert content to the format expected by genai2
+        parts = []
+        
+        # Handle text prompt
+        if isinstance(content[0], str):
+            parts.append(types2.Part.from_text(text=content[0]))
+        
+        # Handle media content
+        for item in content[1:]:
+            if isinstance(item, dict) and "mime_type" in item and "data" in item:
+                parts.append(
+                    types2.Part.from_blob(
+                        data=item["data"],
+                        mime_type=item["mime_type"]
+                    )
+                )
+        
+        # Create content object
+        content_obj = types2.Content(
+            role="user",
+            parts=parts
+        )
+        
+        # Create config with tools and generation parameters
+        config = types2.GenerateContentConfig(
+            tools=tools,
+            temperature=kwargs.get("generation_config", {}).get("temperature", 0),
+            max_output_tokens=kwargs.get("generation_config", {}).get("max_output_tokens", 1000),
+            response_mime_type="text/plain",
+        )
+        
+        # Generate response
+        response = client.models.generate_content(
+            model=MODEL["transcribe_model"],
+            contents=[content_obj],
+            config=config,
+        )
+        
+        # Create a response object similar to the old API
+        class ResponseWrapper:
+            def __init__(self, text):
+                self.text = text
+        
+        if response.candidates and response.candidates[0].content:
+            return ResponseWrapper(response.candidates[0].content.parts[0].text)
+        else:
+            return ResponseWrapper("")
+            
+    # The transcribe model is now just represented by the safe_transcribe function
+    transcribe_model = None  # Not needed as a separate object anymore
     
-transcribe_model = genai.GenerativeModel(
-    'gemini-1.5-flash',
-    system_instruction=system_instruction
-)
+except Exception as e:
+    print(f"Error initializing transcribe model with tools using genai2: {str(e)}")
+    # Fallback to old API
+    transcribe_model = genai.GenerativeModel(
+        MODEL["transcribe_model"],
+        system_instruction=system_instruction
+    )
+    
+    @retry.Retry()
+    async def safe_transcribe(model, content, **kwargs):
+        return model.generate_content(content, **kwargs)
 
 # Conversation storage
 conversations = {}
-
-@retry.Retry()
-async def safe_transcribe(model, content, **kwargs):
-    return model.generate_content(content, **kwargs)
 
 async def ai_handler(event):
     try:
@@ -223,9 +379,15 @@ async def ai_handler(event):
         thread_id = event.id
         formatted_message = f"{user_id}: {query}"
         
+        # Start chat session with Google Search capabilities
         chat_session = gemini_model.start_chat()
         response = chat_session.send_message(formatted_message)
         
+        # Check for valid response
+        if not response.text:
+            await event.reply("⛔ خطا: پاسخی دریافت نشد")
+            return
+            
         sent_message = await event.reply(response.text)
         
         # ذخیره با کلید عمومی
@@ -256,7 +418,7 @@ async def analyze_image(image_path, use_system_instructions=True):
             return f"خطا در پردازش تصویر: {str(img_error)}"
         
         # Resize large images to prevent "payload too big" error
-        MAX_DIMENSION = 512  # Even smaller to be safe
+        MAX_DIMENSION = SETTINGS["max_image_dimension"]
         
         # Check if image needs resizing
         if image.width > MAX_DIMENSION or image.height > MAX_DIMENSION:
@@ -280,6 +442,9 @@ async def analyze_image(image_path, use_system_instructions=True):
         image.save(img_byte_arr, format='JPEG', quality=70)  # Lower quality to reduce size
         img_byte_arr.seek(0)
         
+        # Use genai2 client
+        client = genai2.Client(api_key=GOOGLE["gemini_api_key"])
+        
         # Use updated model with system instructions if requested
         if use_system_instructions:
             # Use the same system instructions as the main model
@@ -288,59 +453,182 @@ async def analyze_image(image_path, use_system_instructions=True):
                 user_data = load_user_data()
                 system_instruction = template.replace('{{USER_DATA}}', format_user_data(user_data))
                 
-            vision_model = genai.GenerativeModel(
-                'gemini-1.5-flash',
-                system_instruction=system_instruction
-            )
+                # Create system instruction content
+                system_content = types2.Content(
+                    role="model",  # for system instructions
+                    parts=[types2.Part.from_text(text=system_instruction)]
+                )
+            
+            # Setup Google Search tool
+            tools = [
+                types2.Tool(google_search=types2.GoogleSearch())
+            ]
+            
+            # Try with tools first
+            try:
+                # Create contents
+                prompt = "این تصویر را به طور خلاصه توصیف کن (به فارسی):"
+                contents = [
+                    system_content,
+                    types2.Content(
+                        role="user",
+                        parts=[
+                            types2.Part.from_text(text=prompt),
+                            types2.Part.from_blob(
+                                data=img_byte_arr.getvalue(),
+                                mime_type="image/jpeg"
+                            )
+                        ]
+                    )
+                ]
+                
+                # Configure options
+                config = types2.GenerateContentConfig(
+                    tools=tools,
+                    response_mime_type="text/plain",
+                )
+                
+                # Generate content
+                response = client.models.generate_content(
+                    model=MODEL["vision_model"],
+                    contents=contents,
+                    config=config
+                )
+                
+                # Check if response is valid
+                if not response.candidates or not response.candidates[0].content:
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                
+                response_text = response.candidates[0].content.parts[0].text
+                if not response_text or response_text.startswith(("Error", "c1\\x", "\\x")):
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                    
+                return response_text
+                
+            except Exception as e:
+                print(f"Error analyzing image with tools: {str(e)}")
+                # Fallback to using the prompt without system instruction
+                prompt = "این تصویر را به طور خلاصه توصیف کن (به فارسی):"
+                contents = [
+                    types2.Content(
+                        role="user",
+                        parts=[
+                            types2.Part.from_text(text=prompt),
+                            types2.Part.from_blob(
+                                data=img_byte_arr.getvalue(),
+                                mime_type="image/jpeg"
+                            )
+                        ]
+                    )
+                ]
+                
+                # Configure options without tools
+                config = types2.GenerateContentConfig(
+                    response_mime_type="text/plain",
+                )
+                
+                # Generate content
+                response = client.models.generate_content(
+                    model=MODEL["vision_model"],
+                    contents=contents,
+                    config=config
+                )
+                
+                # Check response
+                if not response.candidates or not response.candidates[0].content:
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                
+                response_text = response.candidates[0].content.parts[0].text
+                if not response_text or response_text.startswith(("Error", "c1\\x", "\\x")):
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                    
+                return response_text
         else:
             # Simple model without system instructions
-            vision_model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        # Wrap in try-except to catch API errors
-        try:
-            # Analyze image with concise prompt
-            response = vision_model.generate_content([
-                "این تصویر را به طور خلاصه توصیف کن (به فارسی):",
-                {"mime_type": "image/jpeg", "data": img_byte_arr.getvalue()}
-            ])
-            
-            if not response.text or response.text.startswith(("Error", "c1\\x", "\\x")):
-                return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+            try:
+                # Setup Google Search tool
+                tools = [
+                    types2.Tool(google_search=types2.GoogleSearch())
+                ]
                 
-            return response.text
-        except Exception as api_error:
-            return f"خطا در سرویس تحلیل تصویر: {str(api_error)}"
-            
+                # Create contents
+                prompt = "این تصویر را به طور خلاصه توصیف کن (به فارسی):"
+                contents = [
+                    types2.Content(
+                        role="user",
+                        parts=[
+                            types2.Part.from_text(text=prompt),
+                            types2.Part.from_blob(
+                                data=img_byte_arr.getvalue(),
+                                mime_type="image/jpeg"
+                            )
+                        ]
+                    )
+                ]
+                
+                # Configure options
+                config = types2.GenerateContentConfig(
+                    tools=tools,
+                    response_mime_type="text/plain",
+                )
+                
+                # Generate content
+                response = client.models.generate_content(
+                    model=MODEL["vision_model"],
+                    contents=contents,
+                    config=config
+                )
+                
+                # Check response
+                if not response.candidates or not response.candidates[0].content:
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                
+                response_text = response.candidates[0].content.parts[0].text
+                if not response_text or response_text.startswith(("Error", "c1\\x", "\\x")):
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                    
+                return response_text
+                
+            except Exception as e:
+                # Fallback to without tools
+                prompt = "این تصویر را به طور خلاصه توصیف کن (به فارسی):"
+                contents = [
+                    types2.Content(
+                        role="user",
+                        parts=[
+                            types2.Part.from_text(text=prompt),
+                            types2.Part.from_blob(
+                                data=img_byte_arr.getvalue(),
+                                mime_type="image/jpeg"
+                            )
+                        ]
+                    )
+                ]
+                
+                # Configure options without tools
+                config = types2.GenerateContentConfig(
+                    response_mime_type="text/plain",
+                )
+                
+                # Generate content
+                response = client.models.generate_content(
+                    model=MODEL["vision_model"],
+                    contents=contents,
+                    config=config
+                )
+                
+                # Check response
+                if not response.candidates or not response.candidates[0].content:
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                
+                response_text = response.candidates[0].content.parts[0].text
+                if not response_text or response_text.startswith(("Error", "c1\\x", "\\x")):
+                    return "خطا در تحلیل تصویر: پاسخ نامعتبر از سرویس تصویر"
+                    
+                return response_text
+                
     except Exception as e:
         return f"خطا در تحلیل تصویر: {str(e)}"
-
-async def analyze_pdf(pdf_path):
-    """Analyze PDF directly using Gemini model"""
-    try:
-        # Use updated model with system instructions
-        with open(SYSTEM_INSTRUCTION_FILE, 'r', encoding='utf-8') as f:
-            template = f.read()
-            user_data = load_user_data()
-            system_instruction = template.replace('{{USER_DATA}}', format_user_data(user_data))
-            
-        vision_model = genai.GenerativeModel(
-            'gemini-1.5-flash',
-            system_instruction=system_instruction
-        )
-        
-        # Read PDF as bytes
-        with open(pdf_path, 'rb') as file:
-            pdf_bytes = file.read()
-        
-        # Analyze PDF
-        response = vision_model.generate_content([
-            "این یک فایل PDF است. لطفا محتوای آن را به طور کامل تحلیل کن و به زبان فارسی توضیح بده که چه چیزی در آن نوشته شده است:",
-            {"mime_type": "application/pdf", "data": pdf_bytes}
-        ])
-        
-        return response.text
-    except Exception as e:
-        return f"خطا در تحلیل PDF: {str(e)}"
 
 async def analyze_video(video_path):
     """Analyze video by extracting frames and analyzing them"""
@@ -476,8 +764,8 @@ async def reply_handler(event):
         if not event.is_reply:
             return
 
-        # Constant for message length (defined at function level to avoid scope issues)
-        MAX_MESSAGE_LENGTH = 4000  # Slightly less than 4096 for safety
+        # Get max message length from settings
+        MAX_MESSAGE_LENGTH = SETTINGS["max_message_length"]
         
         # Get the replied message
         reply_msg = await event.get_reply_message()
@@ -556,9 +844,7 @@ async def reply_handler(event):
                         media_analysis = f"خطا در پردازش تصویر: {str(img_error)}"
                     
                 elif event.document:
-                    if event.document.mime_type == "application/pdf":
-                        media_analysis = await analyze_pdf(media_path)
-                    elif event.document.mime_type.startswith("video/"):
+                    if event.document.mime_type.startswith("video/"):
                         media_analysis = await analyze_video(media_path)
                 elif event.voice:
                     # Read the audio file as bytes
@@ -727,6 +1013,8 @@ async def voice_message_handler(event):
             # Start a new conversation thread for this transcription
             # This allows the user to continue the conversation with the transcribed text
             thread_id = event.id
+            
+            # Get a new chat session with the Google Search tool
             chat_session = gemini_model.start_chat()
             
             # Add initial context about the transcription
@@ -849,52 +1137,70 @@ async def search_handler(event):
         # Start processing
         processing_msg = await event.reply("🔍 در حال جستجو...")
 
-        # Get search results
-        search_results = await search_web(query)
-        
-        # Check for errors
-        if "error" in search_results:
-            await processing_msg.delete()
-            await event.reply(f"❌ خطا در جستجو: {search_results['error']}")
-            return
-            
-        if "items" not in search_results:
-            await processing_msg.delete()
-            await event.reply("❌ نتیجه‌ای یافت نشد")
-            return
-
-        # Get actual page contents
-        contents = []
-        for item in search_results['items'][:3]:  # Top 3 results
-            content = await fetch_page_content(item['link'])
-            contents.append(f"منبع {item['link']}:\n{content}")
-        
-        # Generate answer
-        prompt = f"""
-        با استفاده از این اطلاعات به زبان فارسی پاسخ بده:
-        {''.join(contents)}
-        
-        سوال: {query}
-        پاسخ:
-        """
-        
-        # Start a chat session to maintain context
+        # Start a chat session with the Google Search tool
+        # Gemini model was already initialized with the Google Search tool
         chat_session = gemini_model.start_chat()
-        response = chat_session.send_message(prompt)
         
-        # Format response with sources
-        sources = "\n".join([f"🔗 {item['link']}" for item in search_results['items'][:3]])
-        final_response = f"{response.text}\n\nمنابع:\n{sources}"
-        
-        await processing_msg.delete()
-        sent_message = await event.reply(final_response)
+        try:
+            # Try to use the built-in Google Search capability
+            prompt = f"لطفا اینترنت را جستجو کن و به این سوال به فارسی پاسخ دهید: {query}"
+            response = chat_session.send_message(prompt)
+            
+            # Check if response is valid
+            if not response.text or "نمی‌توانم جستجوی وب" in response.text or "I cannot search" in response.text:
+                raise Exception("Google Search tool failed")
+                
+            # Send the response
+            await processing_msg.delete()
+            sent_message = await event.reply(response.text)
+            
+        except Exception:
+            # Fallback to the old search method if built-in search fails
+            # Get search results
+            search_results = await search_web(query)
+            
+            # Check for errors
+            if "error" in search_results:
+                await processing_msg.delete()
+                await event.reply(f"❌ خطا در جستجو: {search_results['error']}")
+                return
+                
+            if "items" not in search_results:
+                await processing_msg.delete()
+                await event.reply("❌ نتیجه‌ای یافت نشد")
+                return
+
+            # Get actual page contents
+            contents = []
+            for item in search_results['items'][:3]:  # Top 3 results
+                content = await fetch_page_content(item['link'])
+                contents.append(f"منبع {item['link']}:\n{content}")
+            
+            # Generate answer
+            prompt = f"""
+            با استفاده از این اطلاعات به زبان فارسی پاسخ بده:
+            {''.join(contents)}
+            
+            سوال: {query}
+            پاسخ:
+            """
+            
+            # Use the chat session we created
+            response = chat_session.send_message(prompt)
+            
+            # Format response with sources
+            sources = "\n".join([f"🔗 {item['link']}" for item in search_results['items'][:3]])
+            final_response = f"{response.text}\n\nمنابع:\n{sources}"
+            
+            await processing_msg.delete()
+            sent_message = await event.reply(final_response)
+            
+            # Save initial context about the search
+            chat_session.send_message(f"User searched for '{query}' and I provided search results.")
         
         # Start a new conversation thread for this search
         # This allows the user to reply to the search results
         thread_id = event.id
-        
-        # Save initial context about the search
-        chat_session.send_message(f"User searched for '{query}' and I provided search results. My response included information from: {sources}")
         
         # Save conversation
         key = (event.chat_id, thread_id)
@@ -906,12 +1212,14 @@ async def search_handler(event):
 
     except Exception as e:
         await event.reply(f"خطا در جستجو: {str(e)}")
+        if 'processing_msg' in locals():
+            await processing_msg.delete()
 
 async def image_analysis_handler(event):
     """Handle direct image analysis requests"""
     try:
-        # Constant for message length (defined at function level to avoid scope issues)
-        MAX_MESSAGE_LENGTH = 4000  # Slightly less than 4096 for safety
+        # Get max message length from settings
+        MAX_MESSAGE_LENGTH = SETTINGS["max_message_length"]
         
         # Skip messages that are replies to our own messages (handled by reply_handler)
         if event.is_reply:
@@ -1022,6 +1330,7 @@ async def image_analysis_handler(event):
             # Start a new conversation thread for this analysis
             # This allows the user to reply to the analysis
             thread_id = event.id
+            # Get a new chat session with Google Search capabilities
             chat_session = gemini_model.start_chat()
             
             # Add initial context about the image
@@ -1064,7 +1373,7 @@ async def image_generation_handler(event):
                 f.write(data)
                 
         def generate_image(prompt, output_file):
-            client = genai2.Client(api_key="AIzaSyCHnUFbwJER66p1d3KPmaIUljDhsV1oHts")
+            client = genai2.Client(api_key=GOOGLE["image_generation_api_key"])
 
             contents = [
                 types2.Content(
@@ -1084,7 +1393,7 @@ async def image_generation_handler(event):
 
             try:
                 response = client.models.generate_content_stream(
-                    model="gemini-2.0-flash-exp-image-generation",
+                    model=MODEL["image_generation_model"],
                     contents=contents,
                     config=config,
                 )
